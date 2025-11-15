@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aventura de Helio - Salto de Plataforma CORREGIDO</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        #loading {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            font-family: Arial, sans-serif; font-size: 24px; color: white;
+            background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px;
+            pointer-events: none;
+            z-index: 10;
+            text-align: center;
+        }
+        #controls-info {
+            position: absolute; bottom: 20px; left: 20px;
+            color: #fff; font-family: sans-serif; font-size: 14px;
+            background: rgba(0,0,0,0.5); padding: 15px; border-radius: 8px;
+            pointer-events: none; user-select: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Cargando mundo...</div>
+    <div id="controls-info">
+        <b>Controles:</b><br>
+        ⬆ / ⬇ : Caminar<br>
+        ⬅ / ➡ : Girar Personaje<br>
+        ESPACIO : **Saltar (Medio - Aprox. 0.5u)**<br>
+        MOUSE : Rotar Cámara
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- CONFIGURACIÓN ---
+        const TREE_SCALE = 0.03;       
+        const ROCK_SCALE = 0.7;        
+        const MOVE_SPEED = 6.0;
+        const ROTATE_SPEED = 3.5;
+        const SPAWN_SAFE_RADIUS = 15;  
+        
+        // Río
+        const RIVER_Z_POS = 35;        
+        const RIVER_WIDTH = 18;        
+        const MAP_SIZE = 150;          
+        
+        // FÍSICA DE SALTO
+        // ** VALOR AJUSTADO A 3.5 PARA ALCANZAR UNA ALTURA DE PICO DE APROXIMADAMENTE 0.5 UNIDADES **
+        const JUMP_FORCE = 3.5;          
+        const GRAVITY = 12.0;            
+        const CHARACTER_HEIGHT_OFFSET = 1.0; 
+
+        // --- VARIABLES GLOBALES ---
+        let scene, camera, renderer, clock, controls;
+        let model, mixer;
+        let actions = {};
+        let activeAction;
+        
+        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, Space: false };
+        
+        let isJumping = false;         
+        let isDefeated = false; 
+        let verticalSpeed = 0;         
+        let isOnGround = true;         
+
+        const treeBoxes = []; 
+        const rockBoxes = []; 
+
+        const riverMinZ = RIVER_Z_POS - (RIVER_WIDTH / 2);
+        const riverMaxZ = RIVER_Z_POS + (RIVER_WIDTH / 2);
+
+        init();
+        animate();
+
+        async function init() {
+            // 1. Escena
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87CEEB);
+            scene.fog = new THREE.Fog(0x87CEEB, 15, 90);
+            clock = new THREE.Clock();
+
+            // 2. Cámara
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+            camera.position.set(0, 6, -10);
+
+            // 3. Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            // 4. Controles
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.minDistance = 3;
+            controls.maxDistance = 25;
+            controls.maxPolarAngle = Math.PI / 2 - 0.05;
+            controls.target.set(0, CHARACTER_HEIGHT_OFFSET, 0); 
+
+            // 5. Luces
+            const ambient = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+            scene.add(ambient);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            dirLight.position.set(20, 30, 10);
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.set(2048, 2048);
+            const shadowSize = 80;
+            dirLight.shadow.camera.top = shadowSize;
+            dirLight.shadow.camera.bottom = -shadowSize;
+            dirLight.shadow.camera.left = -shadowSize;
+            dirLight.shadow.camera.right = shadowSize;
+            scene.add(dirLight);
+
+            // 6. Suelo
+            const ground = new THREE.Mesh(
+                new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE),
+                new THREE.MeshStandardMaterial({ color: 0x4caf50 }) 
+            );
+            ground.rotation.x = -Math.PI / 2;
+            ground.receiveShadow = true;
+            scene.add(ground);
+
+            // 7. Río
+            const riverGeo = new THREE.PlaneGeometry(MAP_SIZE, RIVER_WIDTH);
+            const riverMat = new THREE.MeshStandardMaterial({ 
+                color: 0x2244ff, 
+                roughness: 0.1,
+                emissive: 0x000055
+            });
+            const river = new THREE.Mesh(riverGeo, riverMat);
+            river.rotation.x = -Math.PI / 2;
+            river.position.set(0, 0.05, RIVER_Z_POS);
+            scene.add(river);
+
+            // 8. Cargar Assets
+            const loader = new GLTFLoader();
+
+            // A) Árboles
+            try {
+                const treeGltf = await loader.loadAsync('treelaurel.glb');
+                const baseTree = treeGltf.scene;
+                baseTree.scale.set(TREE_SCALE, TREE_SCALE, TREE_SCALE);
+                baseTree.traverse(c => { if(c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+                generateForest(baseTree);
+            } catch (err) {
+                console.warn("Usando árboles fallback.", err);
+            }
+
+            // B) Rocas
+            try {
+                const rockGltf = await loader.loadAsync('rock.glb');
+                const baseRock = rockGltf.scene;
+                baseRock.scale.set(ROCK_SCALE, ROCK_SCALE, ROCK_SCALE); 
+                baseRock.traverse(c => { if(c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+                generateRocks(baseRock);
+            } catch (err) {
+                console.warn("No se encontró rock.glb, no se generarán rocas.", err);
+            }
+
+            // C) Personaje
+            loader.load('Helio22.glb', (gltf) => {
+                model = gltf.scene;
+                model.traverse(c => { if(c.isMesh) c.castShadow = true; });
+                scene.add(model);
+                
+                model.position.y = CHARACTER_HEIGHT_OFFSET;
+
+                // Animaciones
+                mixer = new THREE.AnimationMixer(model);
+                const clips = gltf.animations;
+                const findClip = (name) => clips.find(c => c.name.includes(name));
+
+                actions.Idle = mixer.clipAction(findClip('Idle'));
+                actions.Walk = mixer.clipAction(findClip('Walk'));
+                actions.Jump = mixer.clipAction(findClip('Jump2')); 
+                actions.Defeated = mixer.clipAction(findClip('Defeated')); 
+
+                activeAction = actions.Idle;
+                if(activeAction) activeAction.play();
+
+                if (actions.Jump) {
+                    actions.Jump.setLoop(THREE.LoopOnce);
+                    actions.Jump.clampWhenFinished = true;
+                }
+                
+                if (actions.Defeated) {
+                    actions.Defeated.setLoop(THREE.LoopOnce);
+                    actions.Defeated.clampWhenFinished = true;
+                    mixer.addEventListener('finished', (e) => {
+                        if (e.action === actions.Defeated) {
+                            resetCharacter();
+                        }
+                    });
+                }
+
+                controls.target.copy(model.position);
+                controls.update();
+
+                document.getElementById('loading').style.display = 'none';
+            }, undefined, (err) => {
+                console.error(err);
+                document.getElementById('loading').innerText = "Error: Falta Helio22.glb";
+            });
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('keydown', (e) => {
+                if(e.code === 'Space') keys.Space = true;
+                if(e.code === 'ArrowUp') keys.ArrowUp = true;
+                if(e.code === 'ArrowDown') keys.ArrowDown = true;
+                if(e.code === 'ArrowLeft') keys.ArrowLeft = true;
+                if(e.code === 'ArrowRight') keys.ArrowRight = true;
+            });
+            window.addEventListener('keyup', (e) => {
+                if(e.code === 'Space') keys.Space = false;
+                if(e.code === 'ArrowUp') keys.ArrowUp = false;
+                if(e.code === 'ArrowDown') keys.ArrowDown = false;
+                if(e.code === 'ArrowLeft') keys.ArrowLeft = false;
+                if(e.code === 'ArrowRight') keys.ArrowRight = false;
+            });
+        }
+
+        function resetCharacter() {
+            if (!model) return;
+            
+            isDefeated = false;
+            isOnGround = true;
+            verticalSpeed = 0;
+            isJumping = false;
+
+            model.position.set(0, CHARACTER_HEIGHT_OFFSET, 0);
+            controls.target.set(0, CHARACTER_HEIGHT_OFFSET, 0); 
+            camera.position.set(0, 6, -10); 
+            controls.update(); 
+
+            fadeToAction('Idle', 0.1);
+        }
+
+        function generateForest(treeModel) {
+            const count = 100; 
+            const spread = MAP_SIZE - 10;
+            for(let i=0; i<count; i++) {
+                let x, z, validPos = false, attempts = 0;
+                while(!validPos && attempts < 100) {
+                    x = (Math.random() - 0.5) * spread;
+                    z = (Math.random() - 0.5) * spread;
+                    const distOrigin = Math.sqrt(x*x + z*z);
+                    const inRiver = (z > riverMinZ - 2 && z < riverMaxZ + 2);
+                    if (distOrigin > SPAWN_SAFE_RADIUS && !inRiver) validPos = true;
+                    attempts++;
+                }
+                if(validPos) {
+                    const tree = treeModel.clone();
+                    tree.position.set(x, 0, z);
+                    tree.rotation.y = Math.random() * Math.PI * 2;
+                    scene.add(tree);
+                    const box = new THREE.Box3();
+                    const width = 0.8; 
+                    box.min.set(x - width/2, 0, z - width/2);
+                    box.max.set(x + width/2, 10, z + width/2);
+                    treeBoxes.push(box);
+                }
+            }
+        }
+        
+        function generateRocks(rockModel) {
+            const count = 20; 
+            const rockMinX = -(MAP_SIZE / 2) + 10;
+            const rockMaxX = (MAP_SIZE / 2) - 10;
+            const minRockDist = 8; 
+            
+            for(let i=0; i<count; i++) {
+                let x, z;
+                let validPos = false;
+                let attempts = 0;
+
+                while(!validPos && attempts < 100) {
+                    x = THREE.MathUtils.randFloat(rockMinX, rockMaxX);
+                    z = THREE.MathUtils.randFloat(riverMinZ + 3, riverMaxZ - 3);
+
+                    validPos = true;
+                    for (const existingRockBox of rockBoxes) {
+                        const existingRockPos = existingRockBox.getCenter(new THREE.Vector3());
+                        const dist = new THREE.Vector2(x, z).distanceTo(new THREE.Vector2(existingRockPos.x, existingRockPos.z));
+                        if (dist < minRockDist) {
+                            validPos = false;
+                            break;
+                        }
+                    }
+                    attempts++;
+                }
+
+                if (validPos) {
+                    const rock = rockModel.clone();
+                    rock.position.set(x, 0, z); 
+                    rock.rotation.y = Math.random() * Math.PI * 2;
+                    scene.add(rock);
+ 
+                    rock.updateMatrixWorld(true);
+                    
+                    const box = new THREE.Box3().setFromObject(rock);
+                    
+                    const size = new THREE.Vector3();
+                    box.getSize(size);
+                    const center = new THREE.Vector3();
+                    box.getCenter(center);
+                    
+                    const hitboxFactor = 0.8; 
+                    box.min.x = center.x - (size.x * hitboxFactor / 2);
+                    box.max.x = center.x + (size.x * hitboxFactor / 2);
+                    box.min.z = center.z - (size.z * hitboxFactor / 2);
+                    box.max.z = center.z + (size.z * hitboxFactor / 2);
+                    
+                    // La plataforma para aterrizar es solo la parte superior
+                    box.min.y = box.max.y - 0.2; 
+                    
+                    rockBoxes.push(box);
+                }
+            }
+        }
+
+        function fadeToAction(name, duration) {
+            if (!actions[name]) return;
+            if (activeAction === actions[name]) return;
+            const prev = activeAction;
+            activeAction = actions[name];
+            if (prev) prev.fadeOut(duration);
+            activeAction.reset().fadeIn(duration).play();
+        }
+
+        function updateMovement(dt) {
+            if (!model || !actions.Idle) return; 
+            
+            if (isDefeated) {
+                fadeToAction('Defeated', 0.2);
+                return;
+            }
+
+            let isMoving = false; 
+            
+            // 2. Movimiento Horizontal (XZ)
+            if (keys.ArrowLeft) model.rotation.y += ROTATE_SPEED * dt;
+            if (keys.ArrowRight) model.rotation.y -= ROTATE_SPEED * dt;
+
+            const currentPos = model.position.clone();
+            const forward = new THREE.Vector3(0, 0, 1).applyAxisAngle(new THREE.Vector3(0,1,0), model.rotation.y);
+            const backward = new THREE.Vector3(0, 0, -1).applyAxisAngle(new THREE.Vector3(0,1,0), model.rotation.y);
+            
+            const moveVec = new THREE.Vector3();
+            if (keys.ArrowUp) { moveVec.add(forward.multiplyScalar(MOVE_SPEED * dt)); isMoving = true; }
+            if (keys.ArrowDown) { moveVec.add(backward.multiplyScalar(MOVE_SPEED * dt)); isMoving = true; }
+
+            const proposedPos = currentPos.clone().add(moveVec);
+            
+            // 3. Colisión Horizontal (Árboles)
+            let collisionTree = false;
+            const charRadius = 0.3; 
+            const nextBox = new THREE.Box3();
+            nextBox.min.set(proposedPos.x - charRadius, model.position.y - CHARACTER_HEIGHT_OFFSET + 0.1, proposedPos.z - charRadius);
+            nextBox.max.set(proposedPos.x + charRadius, model.position.y + CHARACTER_HEIGHT_OFFSET, proposedPos.z + charRadius);
+
+            for (const treeBox of treeBoxes) {
+                if (nextBox.intersectsBox(treeBox)) {
+                    collisionTree = true;
+                    isMoving = false;
+                    break;
+                }
+            }
+
+            if (!collisionTree) {
+                model.position.x = proposedPos.x;
+                model.position.z = proposedPos.z;
+                controls.target.add(moveVec);
+                camera.position.add(moveVec);
+            }
+
+            // 4. Movimiento Vertical (Salto y Gravedad)
+            
+            let groundHeight = 0.0;
+            let onRock = false;
+            let onGrass = false;
+            const wasFalling = verticalSpeed < 0; 
+
+            const charFeetY = model.position.y - CHARACTER_HEIGHT_OFFSET;
+            
+            const charBaseBox = new THREE.Box3();
+            charBaseBox.min.set(model.position.x - charRadius, charFeetY, model.position.z - charRadius);
+            charBaseBox.max.set(model.position.x + charRadius, charFeetY + 0.1, model.position.z + charRadius);
+            
+            const inRiver = (model.position.z > riverMinZ && model.position.z < riverMaxZ);
+
+            // ¿Está en una roca?
+            for (const rockBox of rockBoxes) {
+                if (charBaseBox.intersectsBox(rockBox)) {
+                    onRock = true;
+                    groundHeight = rockBox.max.y; 
+                    break;
+                }
+            }
+            
+            // ¿Está en la grama?
+            if (!onRock && !inRiver) {
+                onGrass = true;
+                groundHeight = 0.0;
+            }
+            
+            // Asume que está en el aire hasta que aterrice
+            isOnGround = (verticalSpeed < 0 && charFeetY <= groundHeight);
+            
+            // ----------------------------------------------------
+            // Detección y Activación del Salto 
+            // ----------------------------------------------------
+            if (keys.Space && !isJumping && (onRock || onGrass)) {
+                verticalSpeed = JUMP_FORCE; 
+                isOnGround = false;
+                isJumping = true;
+                fadeToAction('Jump', 0.1); 
+            }
+            // ----------------------------------------------------
+
+            // Aplicar gravedad
+            if (!isOnGround) {
+                verticalSpeed -= GRAVITY * dt;
+            } else if (model.position.y - CHARACTER_HEIGHT_OFFSET > groundHeight) {
+                verticalSpeed = 0;
+            }
+            
+            // Aplicar velocidad vertical
+            model.position.y += verticalSpeed * dt;
+
+            // ** LÓGICA DE ATERRIZAJE **
+            const landingY = groundHeight + CHARACTER_HEIGHT_OFFSET;
+
+            if (verticalSpeed < 0 && model.position.y <= landingY) {
+                verticalSpeed = 0;
+                model.position.y = landingY; 
+                isOnGround = true; 
+                isJumping = false; // El salto físico termina al aterrizar
+
+                const toAction = isMoving ? 'Walk' : 'Idle';
+                fadeToAction(toAction, 0.2); 
+            }
+            
+            // 5. Comprobar Derrota (Agua)
+            if (inRiver && !onRock && charFeetY < 0.1) {
+                isDefeated = true;
+                isMoving = false; 
+            }
+
+            // 6. Animaciones de movimiento 
+            if (isOnGround && !isDefeated) {
+                fadeToAction(isMoving ? 'Walk' : 'Idle', 0.2);
+            } 
+
+            // 7. Mover el target de la cámara verticalmente para seguir el salto
+            controls.target.y = model.position.y;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = clock.getDelta();
+            if (mixer) mixer.update(dt);
+            updateMovement(dt);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>
